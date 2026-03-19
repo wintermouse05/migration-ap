@@ -1,0 +1,55 @@
+# Build output
+target/
+build/
+out/
+
+# Keep nested generated directories inside source trees if they are intentionally versioned.
+!**/src/main/**/target/
+!**/src/test/**/target/
+!**/src/main/**/build/
+!**/src/test/**/build/
+
+# Maven wrapper
+!.mvn/wrapper/maven-wrapper.jar
+
+# Java and runtime artifacts
+*.class
+*.log
+logs/
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Kotlin incremental cache
+.kotlin
+
+### IntelliJ IDEA ###
+.idea/
+*.iws
+*.iml
+*.ipr
+
+### Eclipse ###
+.apt_generated
+.classpath
+.factorypath
+.project
+.settings/
+.springBeans
+.sts4-cache
+
+### NetBeans ###
+/nbproject/private/
+/nbbuild/
+/dist/
+/nbdist/
+/.nb-gradle/
+
+### VS Code ###
+.vscode/
+
+### OS files ###
+.DS_Store
+Thumbs.db

@@ -1,0 +1,41 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: migration-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: migration_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: admin123
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d migration_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  oracle:
+    image: gvenzl/oracle-xe:21-slim-faststart
+    container_name: migration-oracle
+    restart: unless-stopped
+    environment:
+      ORACLE_PASSWORD: oracle_admin_123
+      ORACLE_DATABASE: ORCL
+      APP_USER: scott
+      APP_USER_PASSWORD: tiger
+    ports:
+      - "1521:1521"
+    volumes:
+      - oracle_data:/opt/oracle/oradata
+    healthcheck:
+      test: ["CMD", "healthcheck.sh"]
+      interval: 20s
+      timeout: 10s
+      retries: 20
+
+volumes:
+  postgres_data:
+  oracle_data:
