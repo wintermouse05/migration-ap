@@ -5,6 +5,7 @@ import org.example.SqlDialect;
 import org.example.TableDefinition;
 
 import java.sql.Types;
+import java.util.ArrayList;
 import java.util.List;
 
 public class OracleDialect implements SqlDialect {
@@ -97,5 +98,30 @@ public class OracleDialect implements SqlDialect {
 
         sql.append("\n)"); // Oracle không cần dấu ; trong statement thực thi qua JDBC
         return sql.toString();
+    }
+    @Override
+    public List<String> buildAddForeignKeySql(TableDefinition table) {
+        List<String> alterStatements = new ArrayList<>();
+
+        for (ForeignKeyDefinition fk : table.getForeignKeys()) {
+            StringBuilder sql = new StringBuilder();
+
+            String constraintName = fk.getFkName();
+            if (constraintName == null || constraintName.isEmpty()) {
+                // Oracle giới hạn tên identifier max 30 ký tự (trước 12cR2), nên có thể cần logic rút gọn tên ở đây
+                constraintName = "FK_" + table.getTableName() + "_" + fk.getFkColumnName();
+            }
+
+            // Oracle không cần dấu chấm phẩy ; nếu chạy qua JDBC PreparedStatement/Statement
+            sql.append("ALTER TABLE ").append(quoteIdentifier(table.getTableName().toUpperCase())).append("\n");
+            sql.append("    ADD CONSTRAINT ").append(quoteIdentifier(constraintName.toUpperCase())).append("\n");
+            sql.append("    FOREIGN KEY (").append(quoteIdentifier(fk.getFkColumnName().toUpperCase())).append(")\n");
+            sql.append("    REFERENCES ").append(quoteIdentifier(fk.getTargetTableName().toUpperCase()))
+                    .append(" (").append(quoteIdentifier(fk.getTargetColumnName().toUpperCase())).append(")");
+
+            alterStatements.add(sql.toString());
+        }
+
+        return alterStatements;
     }
 }

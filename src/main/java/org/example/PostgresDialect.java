@@ -1,6 +1,7 @@
 package org.example;
 
 import java.sql.Types;
+import java.util.ArrayList;
 import java.util.List;
 
 public class PostgresDialect implements SqlDialect {
@@ -84,5 +85,28 @@ public class PostgresDialect implements SqlDialect {
         sql.append("\n);");
         return sql.toString();
     }
+    @Override
+    public List<String> buildAddForeignKeySql(TableDefinition table) {
+        List<String> alterStatements = new ArrayList<>();
 
+        for (ForeignKeyDefinition fk : table.getForeignKeys()) {
+            StringBuilder sql = new StringBuilder();
+
+            // Xử lý trường hợp tên constraint bị trùng hoặc null
+            String constraintName = fk.getFkName();
+            if (constraintName == null || constraintName.isEmpty()) {
+                constraintName = "fk_" + table.getTableName() + "_" + fk.getFkColumnName();
+            }
+
+            sql.append("ALTER TABLE ").append(quoteIdentifier(table.getTableName())).append("\n");
+            sql.append("    ADD CONSTRAINT ").append(quoteIdentifier(constraintName)).append("\n");
+            sql.append("    FOREIGN KEY (").append(quoteIdentifier(fk.getFkColumnName())).append(")\n");
+            sql.append("    REFERENCES ").append(quoteIdentifier(fk.getTargetTableName()))
+                    .append(" (").append(quoteIdentifier(fk.getTargetColumnName())).append(");");
+
+            alterStatements.add(sql.toString());
+        }
+
+        return alterStatements;
+    }
 }
