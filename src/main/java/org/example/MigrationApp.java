@@ -1,575 +1,69 @@
 package org.example;
 
-import java.sql.Connection;
-import java.sql.SQLException;
-import java.sql.Statement;
-import java.util.ArrayList;
-import java.util.List;
 import java.util.Locale;
 import java.util.TimeZone;
 
 public class MigrationApp {
-    private static final int POOL_INIT_MAX_RETRIES = 20;
-    private static final long POOL_INIT_RETRY_DELAY_MS = 3000;
-    // Cac co migration duoc dieu khien truc tiep trong code (khong doc tu env).
-    private static final boolean MIGRATION_DRY_RUN = false;
-    private static final boolean MIGRATION_SKIP_EXISTING_TABLES = true;
-    private static final boolean MIGRATION_SKIP_EXISTING_FKS = true;
-    private static final boolean MIGRATION_RECREATE_EXISTING_TABLES = true;
 
     public static void main(String[] args) {
         configureAppTimezone();
+
         Boolean metadataTestOverride = resolveMetadataTestOverrideFromArgs(args);
+        String direction = resolveDirection(args);
 
-
-        ConnectionManager manager = ConnectionManager.getInstance();
-
-        // 1. Cấu hình Source DB (Oracle)
-        DatabaseConfig oracleSourceConfig = new DatabaseConfig(
-                DatabaseType.ORACLE,
-                getEnv("ORACLE_HOST", "localhost"),
-                getEnvAsInt("ORACLE_PORT", 1521),
-                getEnv("ORACLE_SERVICE", "ORCL"),
-                getEnv("ORACLE_USER", "scott"),
-                getEnv("ORACLE_USER_PASSWORD", "tiger")
-        );
-
-        // 2. Cấu hình Target DB (PostgreSQL)
-        DatabaseConfig pgTargetConfig = new DatabaseConfig(
-                DatabaseType.POSTGRESQL,
-                getEnv("POSTGRES_HOST", "localhost"),
-                getEnvAsInt("POSTGRES_PORT", 5432),
-                getEnv("POSTGRES_DB", "migration_db"),
-                getEnv("POSTGRES_USER", "postgres"),
-                getEnv("POSTGRES_PASSWORD", "admin123")
-        );
-
-        try {
-            // Khởi tạo Pools
-            createPoolWithRetry(manager, "SOURCE_DB", oracleSourceConfig);
-            createPoolWithRetry(manager, "TARGET_DB", pgTargetConfig);
-
-            // Kiểm tra kết nối trước khi chạy migration
-            if (manager.testConnection("SOURCE_DB") && manager.testConnection("TARGET_DB")) {
-                System.out.println("Bắt đầu tiến trình Migration...");
-
-                List<TableDefinition> allTables;
-
-                // Lấy connection để làm việc
-                try (Connection sourceConn = manager.getConnection("SOURCE_DB");
-                     Connection targetConn = manager.getConnection("TARGET_DB")) {
-                    System.out.println("Source URL: " + sourceConn.getMetaData().getURL());
-                    System.out.println("Target URL: " + targetConn.getMetaData().getURL());
-
-                    MetadataExtractor metadataExtractor = new MetadataExtractor();
-                    String sourceSchema = getEnv(
-                        "SOURCE_SCHEMA",
-                        getEnv("ORACLE_USER", "scott").toUpperCase(Locale.ROOT)
-                    );
-                    String targetSchema = getEnv("TARGET_SCHEMA", "public");
-                    int metadataMaxTables = getEnvAsInt("METADATA_MAX_TABLES", 5);
-                    boolean metadataTestEnabled = metadataTestOverride != null
-                            ? metadataTestOverride
-                            : getEnvAsBoolean("ENABLE_METADATA_TEST", false);
-                    String metadataOutputFormat = getEnv("METADATA_OUTPUT_FORMAT", "json");
-
-                    if (metadataTestOverride != null) {
-                        System.out.println(
-                                "Metadata test override từ startup args: "
-                                        + (metadataTestEnabled ? "BẬT" : "TẮT")
-                        );
-                    }
-
-                    if (metadataTestEnabled) {
-                        runMetadataExtraction(
-                                metadataExtractor,
-                                sourceConn,
-                                sourceSchema,
-                                "SOURCE_DB",
-                                metadataMaxTables,
-                                metadataOutputFormat
-                        );
-                        runMetadataExtraction(
-                                metadataExtractor,
-                                targetConn,
-                                targetSchema,
-                                "TARGET_DB",
-                                metadataMaxTables,
-                                metadataOutputFormat
-                        );
-                    } else {
-                            System.out.println(
-                                "Metadata test đang tắt. Bật ENABLE_METADATA_TEST=true "
-                                    + "hoặc chạy với --enable-metadata-test / --metadata-test=true."
-                            );
-                    }
-
-                    int migrationMaxTables = getEnvAsInt("MIGRATION_MAX_TABLES", 0);
-                    allTables = loadTableDefinitionsForMigration(
-                            metadataExtractor,
-                            sourceConn,
-                            sourceSchema,
-                            migrationMaxTables
-                    );
-
-                } // Tự động trả connection về pool nhờ try-with-resources
-
-                if (allTables.isEmpty()) {
-                    System.out.println("Không có bảng nào để migrate. Kết thúc tiến trình.");
-                } else {
-                    SqlDialect sourceDialect = DialectFactory.getDialect(oracleSourceConfig.getType());
-                    SqlDialect targetDialect = DialectFactory.getDialect(pgTargetConfig.getType());
-                    boolean migrationDryRun = MIGRATION_DRY_RUN;
-
-                    if (migrationDryRun) {
-                        System.out.println("MIGRATION_DRY_RUN=true => chỉ in SQL, không ghi dữ liệu.");
-                        executeMigration(allTables, targetDialect);
-                    } else {
-                        executeMigration(allTables, sourceDialect, targetDialect);
-                    }
-                }
-
-            } else {
-                System.err.println("Không thể thiết lập kết nối, hủy bỏ Migration.");
-            }
-
-        } catch (SQLException | RuntimeException e) {
-            System.err.println("Migration thất bại: " + e.getMessage());
-        } finally {
-            // Đảm bảo dọn dẹp tài nguyên khi kết thúc task
-            manager.closeAllPools();
+        if ("POSTGRES_TO_ORACLE".equals(direction)) {
+            System.out.println("Migration direction: POSTGRES_TO_ORACLE");
+            new PostgresToOracleMigration(metadataTestOverride).run();
+            return;
         }
+
+        System.out.println("Migration direction: ORACLE_TO_POSTGRES");
+        new OracleToPostgresMigration(metadataTestOverride).run();
     }
 
     private static void configureAppTimezone() {
         String timezone = getEnv("APP_TIMEZONE", "UTC");
         TimeZone.setDefault(TimeZone.getTimeZone(timezone));
         System.setProperty("user.timezone", TimeZone.getDefault().getID());
-        System.out.println("Timezone hiện tại của app: " + TimeZone.getDefault().getID());
+        System.out.println("Timezone hien tai cua app: " + TimeZone.getDefault().getID());
     }
 
-    private static void createPoolWithRetry(ConnectionManager manager, String poolId, DatabaseConfig config) {
-        for (int attempt = 1; attempt <= POOL_INIT_MAX_RETRIES; attempt++) {
-            try {
-                manager.createPool(poolId, config);
-                return;
-            } catch (RuntimeException ex) {
-                if (attempt == POOL_INIT_MAX_RETRIES) {
-                    throw ex;
-                }
+    private static String resolveDirection(String[] args) {
+        String fromArgs = findArgValue(args, "--direction=");
+        String rawDirection = (fromArgs == null || fromArgs.isBlank())
+                ? getEnv("MIGRATION_DIRECTION", "ORACLE_TO_POSTGRES")
+                : fromArgs;
 
-                System.err.println(
-                        "Chưa tạo được pool [" + poolId + "] lần " + attempt + "/" + POOL_INIT_MAX_RETRIES
-                                + ", thử lại sau " + (POOL_INIT_RETRY_DELAY_MS / 1000) + " giây. Lý do: "
-                                + ex.getMessage()
-                );
-                sleep(POOL_INIT_RETRY_DELAY_MS);
-            }
+        String normalized = normalizeDirection(rawDirection);
+        if (normalized != null) {
+            return normalized;
         }
+
+        System.err.println(
+                "MIGRATION_DIRECTION khong hop le: " + rawDirection
+                        + ". Dung ORACLE_TO_POSTGRES hoac POSTGRES_TO_ORACLE."
+        );
+        return "ORACLE_TO_POSTGRES";
     }
 
-    private static void sleep(long millis) {
-        try {
-            Thread.sleep(millis);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new RuntimeException("Bị gián đoạn khi chờ kết nối DB.", e);
-        }
-    }
-
-    private static void runMetadataExtraction(
-            MetadataExtractor metadataExtractor,
-            Connection connection,
-            String schema,
-            String connectionLabel,
-            int maxTables,
-            String outputFormat
-    ) throws SQLException {
-        int safeMaxTables = Math.max(1, maxTables);
-        boolean jsonOutput = "json".equalsIgnoreCase(outputFormat);
-        List<String> tableNames = metadataExtractor.getTableNames(connection, schema);
-
-        int displayCount = Math.min(safeMaxTables, tableNames.size());
-        List<TableDefinition> tableDefinitions = new ArrayList<>();
-        for (int i = 0; i < displayCount; i++) {
-            String tableName = tableNames.get(i);
-            TableDefinition tableDefinition = metadataExtractor.extractTableDefinition(connection, schema, tableName);
-            tableDefinitions.add(tableDefinition);
+    private static String normalizeDirection(String value) {
+        if (value == null || value.isBlank()) {
+            return null;
         }
 
-        if (jsonOutput) {
-            System.out.println(buildMetadataJson(connectionLabel, schema, tableNames.size(), displayCount, tableDefinitions));
-            return;
+        String normalized = value.trim().toUpperCase(Locale.ROOT)
+                .replace('-', '_')
+                .replace(' ', '_');
+
+        if ("ORACLE_TO_POSTGRES".equals(normalized) || "O2P".equals(normalized)) {
+            return "ORACLE_TO_POSTGRES";
         }
 
-        System.out.println("\n=== Extract metadata từ " + connectionLabel + " | schema=" + schema + " ===");
-        if (tableNames.isEmpty()) {
-            System.out.println("Không tìm thấy bảng nào trong schema " + schema + ".");
-            return;
+        if ("POSTGRES_TO_ORACLE".equals(normalized) || "P2O".equals(normalized)) {
+            return "POSTGRES_TO_ORACLE";
         }
 
-        System.out.println("Tìm thấy " + tableNames.size() + " bảng, hiển thị " + displayCount + " bảng đầu tiên.");
-
-        for (TableDefinition tableDefinition : tableDefinitions) {
-            printTableDefinition(tableDefinition);
-        }
-
-        if (tableNames.size() > displayCount) {
-            System.out.println("... còn " + (tableNames.size() - displayCount) + " bảng chưa hiển thị.");
-        }
-    }
-
-    private static void printTableDefinition(TableDefinition tableDefinition) {
-        System.out.println("\nTable: " + tableDefinition.getTableName());
-
-        List<ColumnDefinition> columns = tableDefinition.getColumns();
-        if (columns.isEmpty()) {
-            System.out.println("Columns: (none)");
-        } else {
-            System.out.println("Columns:");
-            for (ColumnDefinition column : columns) {
-                System.out.println(
-                        " - " + column.getName() + " | " + column.getTypeName() + "(" + column.getSize() + ")"
-                                + " | nullable=" + column.isNullable()
-                                + " | autoIncrement=" + column.isAutoIncrement()
-                );
-            }
-        }
-
-        List<String> primaryKeys = tableDefinition.getPrimaryKeys();
-        if (primaryKeys.isEmpty()) {
-            System.out.println("Primary Keys: (none)");
-        } else {
-            System.out.println("Primary Keys: " + String.join(", ", primaryKeys));
-        }
-
-        List<ForeignKeyDefinition> foreignKeys = tableDefinition.getForeignKeys();
-        if (foreignKeys.isEmpty()) {
-            System.out.println("Foreign Keys: (none)");
-        } else {
-            System.out.println("Foreign Keys:");
-            for (ForeignKeyDefinition fk : foreignKeys) {
-                String fkName = (fk.getFkName() == null || fk.getFkName().isBlank()) ? "(unnamed)" : fk.getFkName();
-                System.out.println(
-                        " - " + fkName + ": " + fk.getFkColumnName()
-                                + " -> " + fk.getTargetTableName() + "." + fk.getTargetColumnName()
-                );
-            }
-        }
-    }
-
-    private static String buildMetadataJson(
-            String connectionLabel,
-            String schema,
-            int totalTables,
-            int displayedTables,
-            List<TableDefinition> tableDefinitions
-    ) {
-        StringBuilder sb = new StringBuilder();
-        sb.append("{\n");
-        sb.append("  \"connection\": ").append(toJsonString(connectionLabel)).append(",\n");
-        sb.append("  \"schema\": ").append(toJsonString(schema)).append(",\n");
-        sb.append("  \"totalTables\": ").append(totalTables).append(",\n");
-        sb.append("  \"displayedTables\": ").append(displayedTables).append(",\n");
-        sb.append("  \"remainingTables\": ").append(Math.max(0, totalTables - displayedTables)).append(",\n");
-        sb.append("  \"tables\": [");
-        if (!tableDefinitions.isEmpty()) {
-            sb.append("\n");
-            for (int i = 0; i < tableDefinitions.size(); i++) {
-                appendTableDefinitionJson(sb, tableDefinitions.get(i), "    ");
-                if (i < tableDefinitions.size() - 1) {
-                    sb.append(",");
-                }
-                sb.append("\n");
-            }
-            sb.append("  ");
-        }
-        sb.append("]\n");
-        sb.append("}");
-        return sb.toString();
-    }
-
-    private static void appendTableDefinitionJson(StringBuilder sb, TableDefinition tableDefinition, String indent) {
-        sb.append(indent).append("{\n");
-        sb.append(indent).append("  \"tableName\": ").append(toJsonString(tableDefinition.getTableName())).append(",\n");
-        sb.append(indent).append("  \"columns\": [");
-
-        List<ColumnDefinition> columns = tableDefinition.getColumns();
-        if (!columns.isEmpty()) {
-            sb.append("\n");
-            for (int i = 0; i < columns.size(); i++) {
-                ColumnDefinition column = columns.get(i);
-                sb.append(indent).append("    {\n");
-                sb.append(indent).append("      \"name\": ").append(toJsonString(column.getName())).append(",\n");
-                sb.append(indent).append("      \"jdbcType\": ").append(column.getJdbcType()).append(",\n");
-                sb.append(indent).append("      \"typeName\": ").append(toJsonString(column.getTypeName())).append(",\n");
-                sb.append(indent).append("      \"size\": ").append(column.getSize()).append(",\n");
-                sb.append(indent).append("      \"nullable\": ").append(column.isNullable()).append(",\n");
-                sb.append(indent).append("      \"autoIncrement\": ").append(column.isAutoIncrement()).append("\n");
-                sb.append(indent).append("    }");
-                if (i < columns.size() - 1) {
-                    sb.append(",");
-                }
-                sb.append("\n");
-            }
-            sb.append(indent).append("  ");
-        }
-        sb.append("],\n");
-
-        List<String> primaryKeys = tableDefinition.getPrimaryKeys();
-        sb.append(indent).append("  \"primaryKeys\": [");
-        for (int i = 0; i < primaryKeys.size(); i++) {
-            sb.append(toJsonString(primaryKeys.get(i)));
-            if (i < primaryKeys.size() - 1) {
-                sb.append(", ");
-            }
-        }
-        sb.append("],\n");
-
-        List<ForeignKeyDefinition> foreignKeys = tableDefinition.getForeignKeys();
-        sb.append(indent).append("  \"foreignKeys\": [");
-        if (!foreignKeys.isEmpty()) {
-            sb.append("\n");
-            for (int i = 0; i < foreignKeys.size(); i++) {
-                ForeignKeyDefinition fk = foreignKeys.get(i);
-                sb.append(indent).append("    {\n");
-                sb.append(indent).append("      \"name\": ").append(toJsonString(fk.getFkName())).append(",\n");
-                sb.append(indent).append("      \"column\": ").append(toJsonString(fk.getFkColumnName())).append(",\n");
-                sb.append(indent).append("      \"targetTable\": ").append(toJsonString(fk.getTargetTableName())).append(",\n");
-                sb.append(indent).append("      \"targetColumn\": ").append(toJsonString(fk.getTargetColumnName())).append("\n");
-                sb.append(indent).append("    }");
-                if (i < foreignKeys.size() - 1) {
-                    sb.append(",");
-                }
-                sb.append("\n");
-            }
-            sb.append(indent).append("  ");
-        }
-        sb.append("]\n");
-        sb.append(indent).append("}");
-    }
-
-    private static String toJsonString(String value) {
-        if (value == null) {
-            return "null";
-        }
-        return "\"" + escapeJson(value) + "\"";
-    }
-
-    private static String escapeJson(String value) {
-        StringBuilder escaped = new StringBuilder();
-        for (int i = 0; i < value.length(); i++) {
-            char ch = value.charAt(i);
-            switch (ch) {
-                case '\\' -> escaped.append("\\\\");
-                case '\"' -> escaped.append("\\\"");
-                case '\n' -> escaped.append("\\n");
-                case '\r' -> escaped.append("\\r");
-                case '\t' -> escaped.append("\\t");
-                default -> escaped.append(ch);
-            }
-        }
-        return escaped.toString();
-    }
-
-    private static List<TableDefinition> loadTableDefinitionsForMigration(
-            MetadataExtractor metadataExtractor,
-            Connection sourceConn,
-            String sourceSchema,
-            int migrationMaxTables
-    ) throws SQLException {
-        List<String> tableNames = metadataExtractor.getTableNames(sourceConn, sourceSchema);
-        if (tableNames.isEmpty()) {
-            return new ArrayList<>();
-        }
-
-        int safeLimit = migrationMaxTables > 0 ? Math.min(migrationMaxTables, tableNames.size()) : tableNames.size();
-        if (safeLimit < tableNames.size()) {
-            System.out.println("Giới hạn migrate " + safeLimit + "/" + tableNames.size()
-                    + " bảng do MIGRATION_MAX_TABLES=" + migrationMaxTables);
-        }
-
-        List<TableDefinition> allTables = new ArrayList<>();
-        for (int i = 0; i < safeLimit; i++) {
-            String tableName = tableNames.get(i);
-            allTables.add(metadataExtractor.extractTableDefinition(sourceConn, sourceSchema, tableName));
-        }
-
-        return allTables;
-    }
-
-    private static void executeMigration(List<TableDefinition> allTables, SqlDialect targetDialect) {
-        System.out.println("\n--- PHASE 1: CREATING TABLES ---");
-        for (TableDefinition table : allTables) {
-            String createSql = normalizeSqlForJdbc(targetDialect.buildCreateTableSql(table));
-            System.out.println(createSql);
-        }
-
-        System.out.println("\n--- PHASE 2: MIGRATING DATA (Skipped in this dry-run) ---");
-
-        System.out.println("\n--- PHASE 3: ADDING FOREIGN KEYS ---");
-        for (TableDefinition table : allTables) {
-            List<String> fkSqls = targetDialect.buildAddForeignKeySql(table);
-            for (String fkSql : fkSqls) {
-                System.out.println(normalizeSqlForJdbc(fkSql));
-            }
-        }
-    }
-
-    private static void executeMigration(
-            List<TableDefinition> allTables,
-            SqlDialect sourceDialect,
-            SqlDialect targetDialect
-    ) {
-        ConnectionManager manager = ConnectionManager.getInstance();
-
-        try (Connection sourceConn = manager.getConnection("SOURCE_DB");
-             Connection targetConn = manager.getConnection("TARGET_DB")) {
-
-            int batchSize = Math.max(1, getEnvAsInt("MIGRATION_BATCH_SIZE", 1000));
-            boolean skipExistingTables = MIGRATION_SKIP_EXISTING_TABLES;
-            boolean skipExistingForeignKeys = MIGRATION_SKIP_EXISTING_FKS;
-            boolean recreateExistingTables = MIGRATION_RECREATE_EXISTING_TABLES;
-
-            if (recreateExistingTables) {
-                dropTargetTablesPhase(targetConn, allTables, targetDialect);
-            }
-
-            runCreateTablesPhase(targetConn, allTables, targetDialect, skipExistingTables);
-
-            System.out.println("\n--- PHASE 2: MIGRATING DATA ---");
-            SqlGenerator sqlGenerator = new SqlGenerator(sourceDialect, targetDialect);
-            DataTransferService transferService = new DataTransferService(sqlGenerator);
-            for (TableDefinition table : allTables) {
-                try {
-                    transferService.transferTableData(sourceConn, targetConn, table, batchSize);
-                } catch (SQLException e) {
-                    System.err.println("Bỏ qua bảng " + table.getTableName() + " do lỗi dữ liệu. Lý do: " + e.getMessage());
-                }
-            }
-
-            runAddForeignKeysPhase(targetConn, allTables, targetDialect, skipExistingForeignKeys);
-
-        } catch (Exception e) {
-            System.err.println("Migration thất bại: " + e.getMessage());
-        }
-    }
-
-    private static void runCreateTablesPhase(
-            Connection targetConn,
-            List<TableDefinition> allTables,
-            SqlDialect targetDialect,
-            boolean skipExistingTables
-    )
-            throws SQLException {
-        System.out.println("\n--- PHASE 1: CREATING TABLES ---");
-
-        try (Statement statement = targetConn.createStatement()) {
-            for (TableDefinition table : allTables) {
-                String createSql = normalizeSqlForJdbc(targetDialect.buildCreateTableSql(table));
-                try {
-                    statement.execute(createSql);
-                    System.out.println("Created table: " + table.getTableName());
-                } catch (SQLException e) {
-                    if (skipExistingTables && isTableAlreadyExistsError(e)) {
-                        System.out.println("Skipped existing table: " + table.getTableName());
-                        continue;
-                    }
-                    throw e;
-                }
-            }
-        }
-    }
-
-    private static void dropTargetTablesPhase(
-            Connection targetConn,
-            List<TableDefinition> allTables,
-            SqlDialect targetDialect
-    ) throws SQLException {
-        if (!(targetDialect instanceof PostgresDialect)) {
-            System.out.println("Co MIGRATION_RECREATE_EXISTING_TABLES trong code chi ho tro PostgreSQL target o phien ban hien tai.");
-            return;
-        }
-
-        System.out.println("\n--- PRE-PHASE: DROPPING EXISTING TABLES ---");
-        try (Statement statement = targetConn.createStatement()) {
-            for (int i = allTables.size() - 1; i >= 0; i--) {
-                TableDefinition table = allTables.get(i);
-                String dropSql = "DROP TABLE IF EXISTS "
-                        + targetDialect.quoteIdentifier(table.getTableName())
-                        + " CASCADE";
-                statement.execute(dropSql);
-                System.out.println("Dropped table if exists: " + table.getTableName());
-            }
-        }
-    }
-
-    private static void runAddForeignKeysPhase(
-            Connection targetConn,
-            List<TableDefinition> allTables,
-            SqlDialect targetDialect,
-            boolean skipExistingForeignKeys
-    )
-            throws SQLException {
-        System.out.println("\n--- PHASE 3: ADDING FOREIGN KEYS ---");
-
-        try (Statement statement = targetConn.createStatement()) {
-            for (TableDefinition table : allTables) {
-                List<String> fkSqls = targetDialect.buildAddForeignKeySql(table);
-                for (String fkSql : fkSqls) {
-                    String normalizedFkSql = normalizeSqlForJdbc(fkSql);
-                    try {
-                        statement.execute(normalizedFkSql);
-                        System.out.println("Added FK for table: " + table.getTableName());
-                    } catch (SQLException e) {
-                        if (skipExistingForeignKeys && isConstraintAlreadyExistsError(e)) {
-                            System.out.println("Skipped existing FK on table: " + table.getTableName());
-                            continue;
-                        }
-
-                        if (skipExistingForeignKeys && isIncompatibleForeignKeyError(e)) {
-                            System.err.println(
-                                    "Skipped incompatible FK on table " + table.getTableName()
-                                            + ". Goi y: dat MIGRATION_RECREATE_EXISTING_TABLES=true trong code de dong bo lai schema target."
-                            );
-                            continue;
-                        }
-                        throw e;
-                    }
-                }
-            }
-        }
-    }
-
-    private static String normalizeSqlForJdbc(String sql) {
-        String normalized = sql.trim();
-        if (normalized.endsWith(";")) {
-            return normalized.substring(0, normalized.length() - 1);
-        }
-        return normalized;
-    }
-
-    private static boolean isTableAlreadyExistsError(SQLException e) {
-        String sqlState = e.getSQLState();
-        String message = e.getMessage() == null ? "" : e.getMessage().toLowerCase(Locale.ROOT);
-        return "42P07".equals(sqlState)
-                || message.contains("already exists")
-                || message.contains("ora-00955");
-    }
-
-    private static boolean isConstraintAlreadyExistsError(SQLException e) {
-        String sqlState = e.getSQLState();
-        String message = e.getMessage() == null ? "" : e.getMessage().toLowerCase(Locale.ROOT);
-        return "42710".equals(sqlState)
-                || message.contains("constraint") && message.contains("already exists")
-                || message.contains("ora-02275");
-    }
-
-    private static boolean isIncompatibleForeignKeyError(SQLException e) {
-        String sqlState = e.getSQLState();
-        String message = e.getMessage() == null ? "" : e.getMessage().toLowerCase(Locale.ROOT);
-        return "42804".equals(sqlState)
-                || (message.contains("foreign key") && message.contains("incompatible types"));
+        return null;
     }
 
     private static Boolean resolveMetadataTestOverrideFromArgs(String[] args) {
@@ -596,8 +90,8 @@ public class MigrationApp {
                     override = parsed;
                 } else {
                     System.err.println(
-                            "Tham số --metadata-test=" + value + " không hợp lệ. "
-                                    + "Dùng true/false, on/off, 1/0, yes/no."
+                            "Tham so --metadata-test=" + value + " khong hop le. "
+                                    + "Dung true/false, on/off, 1/0, yes/no."
                     );
                 }
             }
@@ -606,24 +100,18 @@ public class MigrationApp {
         return override;
     }
 
-    private static String getEnv(String name, String defaultValue) {
-        String value = System.getenv(name);
-        return (value == null || value.isBlank()) ? defaultValue : value;
-    }
-
-    private static boolean getEnvAsBoolean(String name, boolean defaultValue) {
-        String value = System.getenv(name);
-        if (value == null || value.isBlank()) {
-            return defaultValue;
+    private static String findArgValue(String[] args, String prefix) {
+        if (args == null || args.length == 0) {
+            return null;
         }
 
-        Boolean parsed = parseBooleanValue(value);
-        if (parsed != null) {
-            return parsed;
+        for (String arg : args) {
+            if (arg != null && arg.startsWith(prefix)) {
+                return arg.substring(prefix.length());
+            }
         }
 
-        System.err.println("Biến môi trường " + name + " không hợp lệ, dùng mặc định " + defaultValue);
-        return defaultValue;
+        return null;
     }
 
     private static Boolean parseBooleanValue(String value) {
@@ -651,17 +139,8 @@ public class MigrationApp {
         return null;
     }
 
-    private static int getEnvAsInt(String name, int defaultValue) {
+    private static String getEnv(String name, String defaultValue) {
         String value = System.getenv(name);
-        if (value == null || value.isBlank()) {
-            return defaultValue;
-        }
-
-        try {
-            return Integer.parseInt(value);
-        } catch (NumberFormatException ex) {
-            System.err.println("Biến môi trường " + name + " không hợp lệ, dùng mặc định " + defaultValue);
-            return defaultValue;
-        }
+        return (value == null || value.isBlank()) ? defaultValue : value;
     }
 }
