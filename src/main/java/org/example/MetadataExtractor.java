@@ -1,6 +1,5 @@
 package org.example;
 
-import javax.swing.text.TabExpander;
 import java.sql.Connection;
 import java.sql.DatabaseMetaData;
 import java.sql.ResultSet;
@@ -30,11 +29,20 @@ public class MetadataExtractor {
                 int dataType = rsColumns.getInt("DATA_TYPE");
                 String typeName = rsColumns.getString("TYPE_NAME");
                 int size = rsColumns.getInt("COLUMN_SIZE");
+                int scale = rsColumns.getInt("DECIMAL_DIGITS");
                 int nullable = rsColumns.getInt("NULLABLE");
                 String isAutoIncStr = rsColumns.getString("IS_AUTOINCREMENT");
                 boolean isNullable = (nullable == 1);
                 boolean isAutoIncrement = "YES".equalsIgnoreCase(isAutoIncStr);
-                ColumnDefinition colDef = new ColumnDefinition(colName, dataType, typeName, size, isNullable, isAutoIncrement);
+                ColumnDefinition colDef = new ColumnDefinition(
+                        colName,
+                        dataType,
+                        typeName,
+                        size,
+                        scale,
+                        isNullable,
+                        isAutoIncrement
+                );
                 tableDef.addColumn(colDef);
             }
         }

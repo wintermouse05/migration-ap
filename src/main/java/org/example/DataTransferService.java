@@ -1,11 +1,9 @@
 package org.example;
 
-import org.example.SqlGenerator;
-import org.example.TableDefinition;
-
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.sql.Types;
 import java.sql.Statement;
 import java.sql.SQLException;
 
@@ -52,9 +50,30 @@ public class DataTransferService {
                 while (rs.next()) {
                     // Đọc từng cột và gán vào tham số của INSERT
                     for (int i = 1; i <= columnCount; i++) {
-                        // getObject() là cách linh hoạt nhất để map dữ liệu cơ bản giữa các JDBC Driver
+                        ColumnDefinition column = table.getColumns().get(i - 1);
+                        int jdbcType = normalizeJdbcTypeForTarget(column.getJdbcType());
+
                         Object value = rs.getObject(i);
-                        targetPstmt.setObject(i, value);
+                        if (value == null) {
+                            targetPstmt.setNull(i, jdbcType);
+                            continue;
+                        }
+
+                        switch (jdbcType) {
+                            case Types.TIMESTAMP:
+                                targetPstmt.setTimestamp(i, rs.getTimestamp(i));
+                                break;
+                            case Types.DATE:
+                                targetPstmt.setDate(i, rs.getDate(i));
+                                break;
+                            case Types.TIME:
+                                targetPstmt.setTime(i, rs.getTime(i));
+                                break;
+                            default:
+                                // Truyền explicit JDBC type để tránh lỗi Oracle-specific object (vd: oracle.sql.TIMESTAMP)
+                                targetPstmt.setObject(i, value, jdbcType);
+                                break;
+                        }
                     }
 
                     // Đưa lệnh INSERT đã được gán giá trị vào danh sách chờ (Batch)
@@ -92,5 +111,15 @@ public class DataTransferService {
             sourceConn.setAutoCommit(originalSourceAutoCommit);
             targetConn.setAutoCommit(originalTargetAutoCommit);
         }
+    }
+
+    private static int normalizeJdbcTypeForTarget(int jdbcType) {
+        if (jdbcType == Types.TIMESTAMP_WITH_TIMEZONE) {
+            return Types.TIMESTAMP;
+        }
+        if (jdbcType == Types.TIME_WITH_TIMEZONE) {
+            return Types.TIME;
+        }
+        return jdbcType;
     }
 }

@@ -1,8 +1,5 @@
 package org.example;
 
-import org.example.SqlDialect;
-import org.example.TableDefinition;
-
 import java.util.List;
 import java.util.stream.Collectors;
 
@@ -37,7 +34,24 @@ public class SqlGenerator {
                 .map(c -> "?")
                 .collect(Collectors.joining(", "));
 
-        return "INSERT INTO " + targetDialect.quoteIdentifier(table.getTableName()) +
-                " (" + colNames + ") VALUES (" + placeholders + ")";
+        StringBuilder sql = new StringBuilder();
+        sql.append("INSERT INTO ")
+            .append(targetDialect.quoteIdentifier(table.getTableName()))
+            .append(" (")
+            .append(colNames)
+            .append(") VALUES (")
+            .append(placeholders)
+            .append(")");
+
+        if (targetDialect instanceof PostgresDialect && !table.getPrimaryKeys().isEmpty()) {
+            String conflictColumns = table.getPrimaryKeys().stream()
+                .map(targetDialect::quoteIdentifier)
+                .collect(Collectors.joining(", "));
+            sql.append(" ON CONFLICT (")
+                .append(conflictColumns)
+                .append(") DO NOTHING");
+        }
+
+        return sql.toString();
     }
 }

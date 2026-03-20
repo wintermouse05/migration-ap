@@ -3,17 +3,23 @@ package org.example;
 import java.sql.Types;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 
 public class PostgresDialect implements SqlDialect {
     @Override
     public String mapDataType(ColumnDefinition columnDefinition) {
         if (columnDefinition.isAutoIncrement()) {
-            if (columnDefinition.getJdbcType() == Types.BIGINT) {
+            if (columnDefinition.getJdbcType() == Types.BIGINT || isOracleNumberType(columnDefinition)) {
                 return "BIGSERIAL";
             }
             return "SERIAL";
 
         }
+
+        if (isOracleNumberType(columnDefinition)) {
+            return mapOracleNumberForPostgres(columnDefinition);
+        }
+
         switch (columnDefinition.getJdbcType()) {
             case Types.VARCHAR:
             case Types.NVARCHAR:
@@ -27,7 +33,10 @@ public class PostgresDialect implements SqlDialect {
                 return "BIGINT";
             case Types.DECIMAL:
             case Types.NUMERIC:
-                return "NUMERIC"; // Có thể mở rộng để lấy precision/scale nếu cần
+                if (columnDefinition.getScale() > 0 && columnDefinition.getSize() > 0) {
+                    return "NUMERIC(" + columnDefinition.getSize() + ", " + columnDefinition.getScale() + ")";
+                }
+                return "NUMERIC";
             case Types.DOUBLE:
             case Types.FLOAT:
                 return "DOUBLE PRECISION";
@@ -48,6 +57,43 @@ public class PostgresDialect implements SqlDialect {
                 // Fallback tạm thời
                 return "VARCHAR(255)";
         }
+    }
+
+    private static boolean isOracleNumberType(ColumnDefinition columnDefinition) {
+        String typeName = columnDefinition.getTypeName();
+        return typeName != null && typeName.toUpperCase(Locale.ROOT).startsWith("NUMBER");
+    }
+
+    private static String mapOracleNumberForPostgres(ColumnDefinition columnDefinition) {
+        int precision = columnDefinition.getSize();
+        int scale = columnDefinition.getScale();
+
+        if (scale > 0) {
+            if (precision > 0) {
+                return "NUMERIC(" + precision + ", " + scale + ")";
+            }
+            return "NUMERIC";
+        }
+
+        if (precision <= 0) {
+            return "BIGINT";
+        }
+
+        if (precision > 0 && precision <= 9) {
+            return "INTEGER";
+        }
+
+        // Oracle NUMBER không khai báo precision thường được JDBC report là 22.
+        // Với cột khóa/ID thực tế thường nằm trong phạm vi BIGINT nên ưu tiên BIGINT để đồng bộ FK.
+        if ((precision > 9 && precision <= 18) || precision == 22) {
+            return "BIGINT";
+        }
+
+        if (precision > 0) {
+            return "NUMERIC(" + precision + ")";
+        }
+
+        return "NUMERIC";
     }
 
     @Override
