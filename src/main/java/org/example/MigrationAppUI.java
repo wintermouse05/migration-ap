@@ -195,8 +195,8 @@ public class MigrationAppUI extends JFrame {
         // Nút Start
         btnStartMigration = new JButton("START MIGRATION");
         btnStartMigration.setFont(new Font("Arial", Font.BOLD, 16));
-        btnStartMigration.setBackground(new Color(46, 204, 113));
-        btnStartMigration.setForeground(Color.WHITE);
+        btnStartMigration.setBackground(new Color(46, 172, 204));
+        btnStartMigration.setForeground(Color.GREEN);
         btnStartMigration.setPreferredSize(new Dimension(200, 50));
         btnStartMigration.addActionListener(e -> startMigrationAction());
 
