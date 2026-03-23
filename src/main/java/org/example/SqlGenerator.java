@@ -54,4 +54,19 @@ public class SqlGenerator {
 
         return sql.toString();
     }
+
+    public String buildExistsByPrimaryKeySql(TableDefinition table) {
+        if (table.getPrimaryKeys().isEmpty()) {
+            throw new IllegalArgumentException("Table " + table.getTableName() + " không có PK để kiểm tra tồn tại.");
+        }
+
+        String whereClause = table.getPrimaryKeys().stream()
+                .map(pk -> targetDialect.quoteIdentifier(pk) + " = ?")
+                .collect(Collectors.joining(" AND "));
+
+        return "SELECT 1 FROM "
+                + targetDialect.quoteIdentifier(table.getTableName())
+                + " WHERE "
+                + whereClause;
+    }
 }

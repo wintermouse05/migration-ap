@@ -1,13 +1,14 @@
 package org.example;
 
-import com.zaxxer.hikari.HikariConfig;
-import com.zaxxer.hikari.HikariDataSource;
-
 import java.sql.Connection;
 import java.sql.SQLException;
-import java.util.HashMap;
+import java.util.Locale;
 import java.util.Map;
+import java.util.TimeZone;
 import java.util.concurrent.ConcurrentHashMap;
+
+import com.zaxxer.hikari.HikariConfig;
+import com.zaxxer.hikari.HikariDataSource;
 
 public class ConnectionManager {
     private static ConnectionManager instance;
@@ -34,6 +35,13 @@ public class ConnectionManager {
         hikariConfig.setPassword(config.getPassword());
         hikariConfig.setDriverClassName(config.getType().getDriverClassName());
         hikariConfig.setMaximumPoolSize(config.getMaximumPoolSize());
+
+        if (config.getType() == DatabaseType.POSTGRESQL) {
+            normalizeJvmTimezoneForPostgres();
+            // Tránh lỗi khi JVM timezone (vd: Asia/Saigon) không được PostgreSQL nhận diện.
+            hikariConfig.addDataSourceProperty("options", "-c TimeZone=UTC");
+            hikariConfig.addDataSourceProperty("TimeZone", "UTC");
+        }
 
         // Các cấu hình tối ưu cho HikariCP
         hikariConfig.setConnectionTimeout(30000); // 30s
@@ -76,6 +84,20 @@ public class ConnectionManager {
     public void closeAllPools() {
         for (String poolId: pools.keySet()) {
             closePool(poolId);
+        }
+    }
+
+    private static void normalizeJvmTimezoneForPostgres() {
+        String timezoneId = TimeZone.getDefault().getID();
+        if (timezoneId == null || timezoneId.isBlank()) {
+            return;
+        }
+
+        String normalized = timezoneId.trim().toLowerCase(Locale.ROOT);
+        if ("asia/saigon".equals(normalized)) {
+            TimeZone safeTz = TimeZone.getTimeZone("Asia/Ho_Chi_Minh");
+            TimeZone.setDefault(safeTz);
+            System.setProperty("user.timezone", safeTz.getID());
         }
     }
 }
