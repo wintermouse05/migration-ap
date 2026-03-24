@@ -16,14 +16,20 @@ public class DataTransferService {
     }
 
     public static final class TransferResult {
+        private final int startOffset;
         private final int transferredRows;
         private final int skippedRows;
         private final boolean limitReached;
 
-        public TransferResult(int transferredRows, int skippedRows, boolean limitReached) {
+        public TransferResult(int startOffset, int transferredRows, int skippedRows, boolean limitReached) {
+            this.startOffset = startOffset;
             this.transferredRows = transferredRows;
             this.skippedRows = skippedRows;
             this.limitReached = limitReached;
+        }
+
+        public int getStartOffset() {
+            return startOffset;
         }
 
         public int getTransferredRows() {
@@ -40,9 +46,11 @@ public class DataTransferService {
     }
 
     private final SqlGenerator sqlGenerator;
+    private final MigrationRetryPolicy retryPolicy;
 
     public DataTransferService(SqlGenerator sqlGenerator) {
         this.sqlGenerator = sqlGenerator;
+        this.retryPolicy = MigrationRetryPolicy.fromEnvironment();
     }
 
     /**
@@ -53,7 +61,7 @@ public class DataTransferService {
      * @param batchSize  Kích thước mỗi lô (ví dụ: 1000, 5000)
      */
     public void transferTableData(Connection sourceConn, Connection targetConn, TableDefinition table, int batchSize) throws SQLException {
-        transferTableData(sourceConn, targetConn, table, batchSize, null, false, null);
+        transferTableData(sourceConn, targetConn, table, batchSize, null, false, 0, null);
     }
 
     public TransferResult transferTableData(
@@ -65,8 +73,38 @@ public class DataTransferService {
             boolean copyNewOnly,
             TransferProgressListener progressListener
     ) throws SQLException {
+        return transferTableData(
+                sourceConn,
+                targetConn,
+                table,
+                batchSize,
+                limitRows,
+                copyNewOnly,
+                0,
+                progressListener
+        );
+    }
 
-        String selectSql = sqlGenerator.buildSelectSql(table);
+    public TransferResult transferTableData(
+            Connection sourceConn,
+            Connection targetConn,
+            TableDefinition table,
+            int batchSize,
+            Integer limitRows,
+            boolean copyNewOnly,
+            int startOffset,
+            TransferProgressListener progressListener
+    ) throws SQLException {
+
+        int safeStartOffset = Math.max(0, startOffset);
+        boolean canResumeByOffset = safeStartOffset > 0 && !table.getPrimaryKeys().isEmpty();
+        if (safeStartOffset > 0 && !canResumeByOffset) {
+            System.out.println("Bang " + table.getTableName()
+                    + " khong co PK, khong the resume theo offset an toan. Bat dau lai tu dau bang.");
+            safeStartOffset = 0;
+        }
+
+        String selectSql = sqlGenerator.buildSelectSql(table, canResumeByOffset);
         String insertSql = sqlGenerator.buildInsertSql(table);
         String existsByPkSql = null;
         int[] pkColumnIndexes = new int[0];
@@ -97,10 +135,18 @@ public class DataTransferService {
             sourceStmt.setFetchSize(safeBatchSize);
 
             try (ResultSet rs = sourceStmt.executeQuery(selectSql)) {
-                int totalTransferred = 0;
+                int totalTransferred = safeStartOffset;
                 int totalSkipped = 0;
                 int currentBatchCount = 0;
                 boolean limitReached = false;
+
+                int skippedByOffset = 0;
+                while (skippedByOffset < safeStartOffset && rs.next()) {
+                    skippedByOffset++;
+                }
+                if (skippedByOffset > 0) {
+                    System.out.println("Resume bang " + table.getTableName() + ": bo qua " + skippedByOffset + " rows da commit.");
+                }
 
                 while (rs.next()) {
                     if (safeLimitRows != null && totalTransferred >= safeLimitRows) {
@@ -141,9 +187,7 @@ public class DataTransferService {
 
                     // Khi Batch đầy, tiến hành gửi sang DB đích và Commit
                     if (currentBatchCount % safeBatchSize == 0) {
-                        targetPstmt.executeBatch();
-                        targetConn.commit(); // Lưu thay đổi xuống DB đích
-                        targetPstmt.clearBatch();
+                        executeBatchWithRetry(targetPstmt, targetConn, table.getTableName());
                         if (progressListener != null) {
                             progressListener.onBatchCommitted(table.getTableName(), currentBatchCount, totalTransferred, totalSkipped);
                         }
@@ -154,8 +198,7 @@ public class DataTransferService {
 
                 // Thực thi nốt những dòng còn dư cuối cùng (nếu số dòng không chia hết cho batchSize)
                 if (currentBatchCount > 0) {
-                    targetPstmt.executeBatch();
-                    targetConn.commit();
+                    executeBatchWithRetry(targetPstmt, targetConn, table.getTableName());
                     if (progressListener != null) {
                         progressListener.onBatchCommitted(table.getTableName(), currentBatchCount, totalTransferred, totalSkipped);
                     }
@@ -163,7 +206,7 @@ public class DataTransferService {
                 }
 
                 System.out.println("Hoàn tất! Tổng cộng: " + totalTransferred + " rows cho bảng " + table.getTableName());
-                return new TransferResult(totalTransferred, totalSkipped, limitReached);
+                return new TransferResult(safeStartOffset, totalTransferred, totalSkipped, limitReached);
             }
 
         } catch (SQLException e) {
@@ -175,6 +218,80 @@ public class DataTransferService {
             // Khôi phục trạng thái ban đầu
             sourceConn.setAutoCommit(originalSourceAutoCommit);
             targetConn.setAutoCommit(originalTargetAutoCommit);
+        }
+    }
+
+    private void executeBatchWithRetry(
+            PreparedStatement targetPstmt,
+            Connection targetConn,
+            String tableName
+    ) throws SQLException {
+        int attempts = retryPolicy.resolveAttempts();
+
+        for (int attempt = 1; attempt <= attempts; attempt++) {
+            try {
+                targetPstmt.executeBatch();
+                targetConn.commit();
+                targetPstmt.clearBatch();
+                return;
+            } catch (SQLException e) {
+                targetConn.rollback();
+                if (!isRetryableException(e) || attempt == attempts) {
+                    throw new SQLException(
+                            "Khong the execute batch bang " + tableName + " sau " + attempt + " lan thu.",
+                            e
+                    );
+                }
+
+                long delayMs = retryPolicy.delayForAttempt(attempt);
+                System.err.println("Batch loi tam thoi bang " + tableName + " lan " + attempt + "/" + attempts
+                        + ", retry sau " + delayMs + " ms. Ly do: " + e.getMessage());
+                sleep(delayMs);
+            }
+        }
+    }
+
+    private static boolean isRetryableException(SQLException e) {
+        if (e == null) {
+            return false;
+        }
+
+        String sqlState = e.getSQLState();
+        if (sqlState != null) {
+            if (sqlState.startsWith("08")
+                    || "40001".equals(sqlState)
+                    || "40P01".equals(sqlState)
+                    || "HYT00".equals(sqlState)
+                    || "HYT01".equals(sqlState)) {
+                return true;
+            }
+        }
+
+        String message = e.getMessage();
+        if (message == null) {
+            return false;
+        }
+
+        String lowered = message.toLowerCase();
+        return lowered.contains("connection")
+                || lowered.contains("socket")
+                || lowered.contains("timed out")
+                || lowered.contains("timeout")
+                || lowered.contains("broken pipe")
+                || lowered.contains("i/o error")
+                || lowered.contains("communications link failure");
+    }
+
+    private static void sleep(long millis) throws SQLException {
+        if (millis <= 0) {
+            return;
+        }
+
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new SQLException("Tien trinh retry batch bi gian doan.", e);
         }
     }
 

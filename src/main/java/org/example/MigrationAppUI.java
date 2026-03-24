@@ -9,7 +9,9 @@ import java.awt.GridBagConstraints;
 import java.awt.GridBagLayout;
 import java.awt.GridLayout;
 import java.awt.Insets;
+import java.util.LinkedHashSet;
 import java.util.Locale;
+import java.util.Set;
 
 import javax.swing.BorderFactory;
 import javax.swing.ButtonGroup;
@@ -48,6 +50,7 @@ public class MigrationAppUI extends JFrame {
     private JRadioButton optCopyAll, optStructureOnly, optDataOnly;
     private JCheckBox chkTruncateTarget, chkCopyNewOnly;
     private JTextField limitDataField;
+    private JTextField includeTablesField, excludeTablesField;
 
     // Actions
     private JButton btnStartMigration;
@@ -172,6 +175,18 @@ public class MigrationAppUI extends JFrame {
         limitDataField.setToolTipText("Nhập 0 để copy toàn bộ");
         limitPanel.add(limitDataField);
 
+        JPanel includePanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
+        includePanel.add(new JLabel("Chỉ migrate các bảng (CSV): "));
+        includeTablesField = new JTextField("", 24);
+        includeTablesField.setToolTipText("Ví dụ: users,orders,order_items");
+        includePanel.add(includeTablesField);
+
+        JPanel excludePanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
+        excludePanel.add(new JLabel("Exclude các bảng (CSV): "));
+        excludeTablesField = new JTextField("", 24);
+        excludeTablesField.setToolTipText("Ví dụ: audit_log,temp_table");
+        excludePanel.add(excludeTablesField);
+
         // Bố trí vào Panel
         gbc.gridx = 0; gbc.gridy = 0; panel.add(optCopyAll, gbc);
         gbc.gridx = 1; gbc.gridy = 0; panel.add(chkTruncateTarget, gbc);
@@ -181,6 +196,10 @@ public class MigrationAppUI extends JFrame {
 
         gbc.gridx = 0; gbc.gridy = 2; panel.add(optDataOnly, gbc);
         gbc.gridx = 1; gbc.gridy = 2; panel.add(limitPanel, gbc);
+
+        gbc.gridx = 0; gbc.gridy = 3; gbc.gridwidth = 2; panel.add(includePanel, gbc);
+        gbc.gridx = 0; gbc.gridy = 4; gbc.gridwidth = 2; panel.add(excludePanel, gbc);
+        gbc.gridwidth = 1;
 
         return panel;
     }
@@ -284,6 +303,9 @@ public class MigrationAppUI extends JFrame {
             return;
         }
 
+        Set<String> includeTables = parseCsvTableSet(includeTablesField.getText());
+        Set<String> excludeTables = parseCsvTableSet(excludeTablesField.getText());
+
         String sourceSchema = resolveDefaultSchema(sourceConfig);
         String targetSchema = resolveDefaultSchema(targetConfig);
 
@@ -299,7 +321,9 @@ public class MigrationAppUI extends JFrame {
             1000,
             truncateTarget,
             copyNewOnly,
-            limitRows
+            limitRows,
+            includeTables,
+            excludeTables
         );
 
         // 3. Lắng nghe sự thay đổi của tiến trình (Progress) để cập nhật thanh JProgressBar
@@ -381,6 +405,26 @@ public class MigrationAppUI extends JFrame {
         } catch (NumberFormatException e) {
             throw new IllegalArgumentException("Limit không hợp lệ: " + raw);
         }
+    }
+
+    private static Set<String> parseCsvTableSet(String raw) {
+        Set<String> parsed = new LinkedHashSet<>();
+        if (raw == null || raw.isBlank()) {
+            return parsed;
+        }
+
+        String[] parts = raw.split(",");
+        for (String part : parts) {
+            if (part == null) {
+                continue;
+            }
+            String value = part.trim();
+            if (value.isEmpty()) {
+                continue;
+            }
+            parsed.add(value.toUpperCase(Locale.ROOT));
+        }
+        return parsed;
     }
 
     /**

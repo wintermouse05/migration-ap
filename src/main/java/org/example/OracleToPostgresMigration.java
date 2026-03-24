@@ -4,8 +4,10 @@ import java.sql.Connection;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 
 public class OracleToPostgresMigration extends DirectionalMigration {
 
@@ -56,7 +58,7 @@ abstract class DirectionalMigration {
     protected static final boolean MIGRATION_DRY_RUN = false;
     protected static final boolean MIGRATION_SKIP_EXISTING_TABLES = true;
     protected static final boolean MIGRATION_SKIP_EXISTING_FKS = true;
-    protected static final boolean MIGRATION_RECREATE_EXISTING_TABLES = true;
+    protected static final boolean MIGRATION_RECREATE_EXISTING_TABLES = false;
 
     private final Boolean metadataTestOverride;
 
@@ -90,9 +92,10 @@ abstract class DirectionalMigration {
                 String sourceSchema = defaultSourceSchema();
                 String targetSchema = defaultTargetSchema();
                 int metadataMaxTables = getEnvAsInt("METADATA_MAX_TABLES", 5);
-                boolean metadataTestEnabled = metadataTestOverride != null
-                        ? metadataTestOverride
-                        : getEnvAsBoolean("ENABLE_METADATA_TEST", false);
+                boolean metadataTestEnabled = getEnvAsBoolean("ENABLE_METADATA_TEST", false);
+                if (metadataTestOverride != null) {
+                    metadataTestEnabled = Boolean.TRUE.equals(metadataTestOverride);
+                }
                 String metadataOutputFormat = getEnv("METADATA_OUTPUT_FORMAT", "json");
 
                 if (metadataTestOverride != null) {
@@ -126,11 +129,15 @@ abstract class DirectionalMigration {
                 }
 
                 int migrationMaxTables = getEnvAsInt("MIGRATION_MAX_TABLES", 0);
+                Set<String> includeTables = parseEnvTableFilter("MIGRATION_INCLUDE_TABLES");
+                Set<String> excludeTables = parseEnvTableFilter("MIGRATION_EXCLUDE_TABLES");
                 allTables = loadTableDefinitionsForMigration(
                         metadataExtractor,
                         sourceConn,
                         sourceSchema,
-                        migrationMaxTables
+                    migrationMaxTables,
+                    includeTables,
+                    excludeTables
                 );
             }
 
@@ -392,10 +399,18 @@ abstract class DirectionalMigration {
             MetadataExtractor metadataExtractor,
             Connection sourceConn,
             String sourceSchema,
-            int migrationMaxTables
+            int migrationMaxTables,
+            Set<String> includeTables,
+            Set<String> excludeTables
     ) throws SQLException {
-        List<String> tableNames = metadataExtractor.getTableNames(sourceConn, sourceSchema);
+        List<String> discoveredTableNames = metadataExtractor.getTableNames(sourceConn, sourceSchema);
+        if (discoveredTableNames.isEmpty()) {
+            return new ArrayList<>();
+        }
+
+        List<String> tableNames = applyTableFilters(discoveredTableNames, includeTables, excludeTables);
         if (tableNames.isEmpty()) {
+            System.out.println("Khong co bang nao phu hop MIGRATION_INCLUDE_TABLES/MIGRATION_EXCLUDE_TABLES.");
             return new ArrayList<>();
         }
 
@@ -412,6 +427,51 @@ abstract class DirectionalMigration {
         }
 
         return allTables;
+    }
+
+    private static List<String> applyTableFilters(
+            List<String> tableNames,
+            Set<String> includeTables,
+            Set<String> excludeTables
+    ) {
+        List<String> filtered = new ArrayList<>();
+        for (String tableName : tableNames) {
+            String normalized = tableName == null ? "" : tableName.trim().toUpperCase(Locale.ROOT);
+            if (normalized.isEmpty()) {
+                continue;
+            }
+
+            if (!includeTables.isEmpty() && !includeTables.contains(normalized)) {
+                continue;
+            }
+
+            if (excludeTables.contains(normalized)) {
+                continue;
+            }
+
+            filtered.add(tableName);
+        }
+
+        return filtered;
+    }
+
+    private static Set<String> parseEnvTableFilter(String envName) {
+        String raw = getEnv(envName, "");
+        Set<String> values = new LinkedHashSet<>();
+        if (raw.isBlank()) {
+            return values;
+        }
+
+        String[] parts = raw.split(",");
+        for (String part : parts) {
+            String value = part == null ? "" : part.trim();
+            if (value.isEmpty()) {
+                continue;
+            }
+            values.add(value.toUpperCase(Locale.ROOT));
+        }
+
+        return values;
     }
 
     private static void executeMigration(List<TableDefinition> allTables, SqlDialect targetDialect) {
@@ -438,17 +498,32 @@ abstract class DirectionalMigration {
             SqlDialect targetDialect
     ) {
         ConnectionManager manager = ConnectionManager.getInstance();
+        MigrationRetryPolicy retryPolicy = MigrationRetryPolicy.fromEnvironment();
+        MigrationCheckpointStore checkpointStore = retryPolicy.isResumeEnabled()
+                ? new MigrationCheckpointStore(retryPolicy.getResumeStateFile())
+                : null;
 
-        try (Connection sourceConn = manager.getConnection("SOURCE_DB");
-             Connection targetConn = manager.getConnection("TARGET_DB")) {
+        try (Connection targetConn = manager.getConnection("TARGET_DB")) {
 
             int batchSize = Math.max(1, getEnvAsInt("MIGRATION_BATCH_SIZE", 1000));
-            boolean skipExistingTables = MIGRATION_SKIP_EXISTING_TABLES;
-            boolean skipExistingForeignKeys = MIGRATION_SKIP_EXISTING_FKS;
-            boolean recreateExistingTables = MIGRATION_RECREATE_EXISTING_TABLES;
+                boolean skipExistingTables = getEnvAsBoolean("MIGRATION_SKIP_EXISTING_TABLES", MIGRATION_SKIP_EXISTING_TABLES);
+                boolean skipExistingForeignKeys = getEnvAsBoolean("MIGRATION_SKIP_EXISTING_FKS", MIGRATION_SKIP_EXISTING_FKS);
+                boolean recreateExistingTables = getEnvAsBoolean(
+                    "MIGRATION_RECREATE_EXISTING_TABLES",
+                    MIGRATION_RECREATE_EXISTING_TABLES
+                );
+
+            printRetryResumeConfig(retryPolicy, checkpointStore);
 
             if (recreateExistingTables) {
                 dropTargetTablesPhase(targetConn, allTables, targetDialect);
+                if (checkpointStore != null) {
+                    checkpointStore.clear();
+                    System.out.println("Resume state da duoc reset do MIGRATION_RECREATE_EXISTING_TABLES=true.");
+                }
+            } else if (retryPolicy.isResetResumeState() && checkpointStore != null) {
+                checkpointStore.clear();
+                System.out.println("Resume state da duoc reset do MIGRATION_RESET_RESUME_STATE=true.");
             }
 
             runCreateTablesPhase(targetConn, allTables, targetDialect, skipExistingTables);
@@ -457,10 +532,22 @@ abstract class DirectionalMigration {
             SqlGenerator sqlGenerator = new SqlGenerator(sourceDialect, targetDialect);
             DataTransferService transferService = new DataTransferService(sqlGenerator);
             for (TableDefinition table : allTables) {
-                try {
-                    transferService.transferTableData(sourceConn, targetConn, table, batchSize);
-                } catch (SQLException e) {
-                    System.err.println("Bo qua bang " + table.getTableName() + " do loi du lieu. Ly do: " + e.getMessage());
+                if (checkpointStore != null && checkpointStore.isTableCompleted(table.getTableName())) {
+                    System.out.println("Bo qua bang da migrate truoc do (resume): " + table.getTableName());
+                    continue;
+                }
+
+                boolean success = transferTableWithRetry(
+                        manager,
+                        transferService,
+                        table,
+                        batchSize,
+                        retryPolicy,
+                        checkpointStore
+                );
+
+                if (!success) {
+                    System.err.println("Bo qua bang " + table.getTableName() + " sau khi da retry het so lan cho phep.");
                 }
             }
 
@@ -469,6 +556,127 @@ abstract class DirectionalMigration {
         } catch (Exception e) {
             System.err.println("Migration that bai: " + e.getMessage());
         }
+    }
+
+    private static boolean transferTableWithRetry(
+            ConnectionManager manager,
+            DataTransferService transferService,
+            TableDefinition table,
+            int batchSize,
+            MigrationRetryPolicy retryPolicy,
+            MigrationCheckpointStore checkpointStore
+    ) {
+        int attempts = retryPolicy.resolveAttempts();
+        boolean hasPrimaryKey = !table.getPrimaryKeys().isEmpty();
+        boolean enableResumeByPk = retryPolicy.isResumeEnabled() && hasPrimaryKey;
+        int startOffset = 0;
+
+        if (checkpointStore != null) {
+            startOffset = checkpointStore.getTableOffset(table.getTableName());
+            if (startOffset > 0) {
+                System.out.println("Resume bang " + table.getTableName() + " tu offset " + startOffset + ".");
+            }
+        }
+
+        for (int attempt = 1; attempt <= attempts; attempt++) {
+            try (Connection sourceConn = manager.getConnection("SOURCE_DB");
+                 Connection targetConn = manager.getConnection("TARGET_DB")) {
+
+                if (attempt > 1) {
+                    System.out.println("Retry bang " + table.getTableName() + " lan " + attempt + "/" + attempts + "...");
+                }
+
+                DataTransferService.TransferResult result = transferService.transferTableData(
+                        sourceConn,
+                        targetConn,
+                        table,
+                        batchSize,
+                        null,
+                        enableResumeByPk,
+                        startOffset,
+                        (tableName, justTransferred, totalTransferred, totalSkipped) -> {
+                            if (checkpointStore != null) {
+                                checkpointStore.updateTableOffset(tableName, totalTransferred);
+                            }
+                        }
+                );
+
+                if (checkpointStore != null) {
+                    checkpointStore.markTableCompleted(table.getTableName(), result.getTransferredRows());
+                }
+
+                return true;
+            } catch (SQLException e) {
+                if (!isRetryableException(e) || attempt == attempts) {
+                    System.err.println("Loi migrate bang " + table.getTableName() + ": " + e.getMessage());
+                    return false;
+                }
+
+                if (checkpointStore != null) {
+                    startOffset = checkpointStore.getTableOffset(table.getTableName());
+                }
+
+                long delayMs = retryPolicy.delayForAttempt(attempt);
+                System.err.println(
+                        "Loi tam thoi khi migrate bang " + table.getTableName()
+                                + " (lan " + attempt + "/" + attempts + "), thu lai sau " + delayMs + " ms. Ly do: "
+                                + e.getMessage()
+                );
+                sleep(delayMs);
+            }
+        }
+
+        return false;
+    }
+
+    private static void printRetryResumeConfig(MigrationRetryPolicy retryPolicy, MigrationCheckpointStore checkpointStore) {
+        System.out.println("Retry policy: enabled=" + retryPolicy.isRetryEnabled()
+                + ", maxAttempts=" + retryPolicy.getMaxAttempts()
+                + ", delayMs=" + retryPolicy.getInitialDelayMs()
+                + ", backoff=" + retryPolicy.getBackoffMultiplier());
+
+        if (!retryPolicy.isResumeEnabled()) {
+            System.out.println("Resume policy: disabled");
+            return;
+        }
+
+        if (checkpointStore == null) {
+            System.out.println("Resume policy: enabled (khong su dung checkpoint file)");
+            return;
+        }
+
+        System.out.println("Resume policy: enabled, stateFile=" + checkpointStore.getStateFilePath());
+    }
+
+    private static boolean isRetryableException(SQLException e) {
+        if (e == null) {
+            return false;
+        }
+
+        String sqlState = e.getSQLState();
+        if (sqlState != null) {
+            if (sqlState.startsWith("08")
+                    || "40001".equals(sqlState)
+                    || "40P01".equals(sqlState)
+                    || "HYT00".equals(sqlState)
+                    || "HYT01".equals(sqlState)) {
+                return true;
+            }
+        }
+
+        String message = e.getMessage();
+        if (message == null) {
+            return false;
+        }
+
+        String lowered = message.toLowerCase(Locale.ROOT);
+        return lowered.contains("connection")
+                || lowered.contains("socket")
+                || lowered.contains("timed out")
+                || lowered.contains("timeout")
+                || lowered.contains("broken pipe")
+                || lowered.contains("i/o error")
+                || lowered.contains("communications link failure");
     }
 
     private static void runCreateTablesPhase(

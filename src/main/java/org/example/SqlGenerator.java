@@ -15,11 +15,28 @@ public class SqlGenerator {
 
     // Tạo lệnh SELECT từ Source
     public String buildSelectSql(TableDefinition table) {
+        return buildSelectSql(table, false);
+    }
+
+    public String buildSelectSql(TableDefinition table, boolean orderByPrimaryKey) {
         String columns = table.getColumns().stream()
                 .map(c -> sourceDialect.quoteIdentifier(c.getName()))
                 .collect(Collectors.joining(", "));
 
-        return "SELECT " + columns + " FROM " + sourceDialect.quoteIdentifier(table.getTableName());
+        StringBuilder sql = new StringBuilder();
+        sql.append("SELECT ")
+                .append(columns)
+                .append(" FROM ")
+                .append(sourceDialect.quoteIdentifier(table.getTableName()));
+
+        if (orderByPrimaryKey && !table.getPrimaryKeys().isEmpty()) {
+            String orderBy = table.getPrimaryKeys().stream()
+                    .map(sourceDialect::quoteIdentifier)
+                    .collect(Collectors.joining(", "));
+            sql.append(" ORDER BY ").append(orderBy);
+        }
+
+        return sql.toString();
     }
 
     // Tạo lệnh INSERT dạng PreparedStatement cho Target

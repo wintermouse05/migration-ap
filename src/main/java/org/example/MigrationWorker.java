@@ -5,9 +5,11 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ExecutionException;
 
 import javax.swing.SwingWorker;
@@ -26,6 +28,9 @@ public class MigrationWorker extends SwingWorker<Void, String> {
     private final boolean truncateTarget;
     private final boolean copyNewOnly;
     private final Integer limitRows;
+    private final Set<String> includeTables;
+    private final Set<String> excludeTables;
+    private final MigrationRetryPolicy retryPolicy;
 
     public MigrationWorker(
             MigrationAppUI ui,
@@ -38,7 +43,9 @@ public class MigrationWorker extends SwingWorker<Void, String> {
             int batchSize,
             boolean truncateTarget,
             boolean copyNewOnly,
-            Integer limitRows
+                Integer limitRows,
+                Set<String> includeTables,
+                Set<String> excludeTables
     ) {
         this.ui = ui;
         this.isStructureOnly = isStructureOnly;
@@ -51,6 +58,9 @@ public class MigrationWorker extends SwingWorker<Void, String> {
         this.truncateTarget = truncateTarget;
         this.copyNewOnly = copyNewOnly;
         this.limitRows = (limitRows != null && limitRows > 0) ? limitRows : null;
+        this.includeTables = normalizeTableFilter(includeTables);
+        this.excludeTables = normalizeTableFilter(excludeTables);
+        this.retryPolicy = MigrationRetryPolicy.fromEnvironment();
     }
 
     /**
@@ -61,6 +71,9 @@ public class MigrationWorker extends SwingWorker<Void, String> {
         ConnectionManager manager = ConnectionManager.getInstance();
         String sourcePoolId = "UI_SOURCE_" + System.currentTimeMillis();
         String targetPoolId = "UI_TARGET_" + System.currentTimeMillis();
+        MigrationCheckpointStore checkpointStore = retryPolicy.isResumeEnabled()
+                ? new MigrationCheckpointStore(retryPolicy.getResumeStateFile())
+                : null;
 
         try {
             setProgress(0);
@@ -82,13 +95,31 @@ public class MigrationWorker extends SwingWorker<Void, String> {
                 publish("Tùy chọn: truncate=" + truncateTarget
                     + ", copyNewOnly=" + copyNewOnly
                     + ", limit=" + (limitRows == null ? "ALL" : limitRows));
+                publish("Filter bảng: include="
+                        + (includeTables.isEmpty() ? "ALL" : String.join(",", includeTables))
+                        + " | exclude="
+                        + (excludeTables.isEmpty() ? "NONE" : String.join(",", excludeTables)));
+                publish("Retry policy: enabled=" + retryPolicy.isRetryEnabled()
+                    + ", maxAttempts=" + retryPolicy.getMaxAttempts()
+                    + ", delayMs=" + retryPolicy.getInitialDelayMs()
+                    + ", backoff=" + retryPolicy.getBackoffMultiplier());
+                publish("Resume policy: enabled=" + retryPolicy.isResumeEnabled()
+                    + " (resume theo offset + table-done state)");
+                if (checkpointStore != null) {
+                    publish("Resume state file: " + checkpointStore.getStateFilePath());
+                    if (retryPolicy.isResetResumeState()) {
+                        checkpointStore.clear();
+                        publish("Resume state da duoc reset do MIGRATION_RESET_RESUME_STATE=true.");
+                    }
+                }
 
                 MetadataExtractor metadataExtractor = new MetadataExtractor();
                 publish("Đang đọc metadata từ schema nguồn: " + sourceSchema + "...");
-                List<String> tableNames = metadataExtractor.getTableNames(sourceConn, sourceSchema);
+                List<String> discoveredTables = metadataExtractor.getTableNames(sourceConn, sourceSchema);
+                List<String> tableNames = applyTableFilters(discoveredTables);
 
                 if (tableNames.isEmpty()) {
-                    publish("Không tìm thấy bảng nào trong schema nguồn " + sourceSchema + ".");
+                    publish("Không có bảng nào phù hợp filter trong schema nguồn " + sourceSchema + ".");
                     setProgress(100);
                     return null;
                 }
@@ -132,30 +163,48 @@ public class MigrationWorker extends SwingWorker<Void, String> {
                     if (truncateTarget) {
                         publish("--- TRUNCATE DỮ LIỆU CŨ TRÊN TARGET ---");
                         runTruncatePhase(targetConn, allTables, targetDialect);
+                        if (checkpointStore != null) {
+                            checkpointStore.clear();
+                            publish("Resume state da duoc reset do chon truncate target.");
+                        }
                     }
 
                     for (int i = 0; i < totalTables; i++) {
                         ensureNotCancelled();
                         TableDefinition table = allTables.get(i);
 
-                        if (copyNewOnly && table.getPrimaryKeys().isEmpty()) {
+                        boolean effectiveCopyNewOnly = copyNewOnly
+                            || (retryPolicy.isResumeEnabled() && !table.getPrimaryKeys().isEmpty());
+
+                        if (checkpointStore != null && checkpointStore.isTableCompleted(table.getTableName())) {
+                            publish("  -> Bo qua bang da migrate truoc do (resume): " + table.getTableName());
+                            setProgress(60 + (int) (((i + 1) / (float) totalTables) * 30));
+                            continue;
+                        }
+
+                        int startOffset = checkpointStore == null ? 0 : checkpointStore.getTableOffset(table.getTableName());
+                        if (startOffset > 0) {
+                            publish("  -> Resume bang " + table.getTableName() + " tu offset " + startOffset + ".");
+                        }
+
+                        if (effectiveCopyNewOnly && table.getPrimaryKeys().isEmpty()) {
                             publish("  -> Bảng " + table.getTableName() + " không có PK, copyNewOnly không thể lọc trùng theo PK.");
                         }
 
                         publish("Đang sao chép dữ liệu bảng " + table.getTableName() + "...");
-                        DataTransferService.TransferResult result = transferService.transferTableData(
-                                sourceConn,
-                                targetConn,
-                                table,
-                                batchSize,
-                                limitRows,
-                                copyNewOnly,
-                                (tableName, justTransferred, totalTransferred, totalSkipped) ->
-                                        publish("    -> Batch " + tableName
-                                                + ": +" + justTransferred
-                                                + " dòng, tổng=" + totalTransferred
-                                                + ", bỏ qua=" + totalSkipped)
+                        DataTransferService.TransferResult result = transferTableWithRetry(
+                            manager,
+                            sourcePoolId,
+                            targetPoolId,
+                            transferService,
+                            table,
+                            effectiveCopyNewOnly,
+                            checkpointStore,
+                            startOffset
                         );
+                        if (checkpointStore != null) {
+                            checkpointStore.markTableCompleted(table.getTableName(), result.getTransferredRows());
+                        }
                         publish("  -> Hoàn tất bảng " + table.getTableName()
                                 + " | copied=" + result.getTransferredRows()
                                 + " | skipped=" + result.getSkippedRows()
@@ -385,6 +434,148 @@ public class MigrationWorker extends SwingWorker<Void, String> {
     private void ensureNotCancelled() {
         if (isCancelled()) {
             throw new RuntimeException("Tiến trình đã bị hủy.");
+        }
+    }
+
+    private List<String> applyTableFilters(List<String> tableNames) {
+        List<String> filtered = new ArrayList<>();
+        for (String tableName : tableNames) {
+            String normalized = tableName == null ? "" : tableName.trim().toUpperCase(Locale.ROOT);
+            if (normalized.isEmpty()) {
+                continue;
+            }
+
+            if (!includeTables.isEmpty() && !includeTables.contains(normalized)) {
+                continue;
+            }
+
+            if (excludeTables.contains(normalized)) {
+                continue;
+            }
+
+            filtered.add(tableName);
+        }
+        return filtered;
+    }
+
+    private static Set<String> normalizeTableFilter(Set<String> rawFilter) {
+        Set<String> normalized = new LinkedHashSet<>();
+        if (rawFilter == null || rawFilter.isEmpty()) {
+            return normalized;
+        }
+
+        for (String value : rawFilter) {
+            if (value == null || value.isBlank()) {
+                continue;
+            }
+            normalized.add(value.trim().toUpperCase(Locale.ROOT));
+        }
+
+        return normalized;
+    }
+
+    private DataTransferService.TransferResult transferTableWithRetry(
+            ConnectionManager manager,
+            String sourcePoolId,
+            String targetPoolId,
+            DataTransferService transferService,
+            TableDefinition table,
+            boolean effectiveCopyNewOnly,
+            MigrationCheckpointStore checkpointStore,
+            int startOffset
+    ) throws SQLException {
+        int attempts = retryPolicy.resolveAttempts();
+        int currentOffset = Math.max(0, startOffset);
+
+        for (int attempt = 1; attempt <= attempts; attempt++) {
+            ensureNotCancelled();
+
+            try (Connection transferSourceConn = manager.getConnection(sourcePoolId);
+                 Connection transferTargetConn = manager.getConnection(targetPoolId)) {
+
+                if (attempt > 1) {
+                    publish("  -> Retry bảng " + table.getTableName() + " lần " + attempt + "/" + attempts + "...");
+                }
+
+                return transferService.transferTableData(
+                        transferSourceConn,
+                        transferTargetConn,
+                        table,
+                        batchSize,
+                        limitRows,
+                        effectiveCopyNewOnly,
+                        currentOffset,
+                        (tableName, justTransferred, totalTransferred, totalSkipped) ->
+                        {
+                            if (checkpointStore != null) {
+                                checkpointStore.updateTableOffset(tableName, totalTransferred);
+                            }
+                            publish("    -> Batch " + tableName
+                                    + ": +" + justTransferred
+                                    + " dòng, tổng=" + totalTransferred
+                                    + ", bỏ qua=" + totalSkipped);
+                        }
+                );
+            } catch (SQLException e) {
+                if (!isRetryableException(e) || attempt == attempts) {
+                    throw e;
+                }
+
+                if (checkpointStore != null) {
+                    currentOffset = checkpointStore.getTableOffset(table.getTableName());
+                }
+
+                long delayMs = retryPolicy.delayForAttempt(attempt);
+                publish("  -> Lỗi tạm thời bảng " + table.getTableName()
+                        + " (" + e.getMessage() + "), sẽ retry sau " + delayMs + " ms.");
+                sleep(delayMs);
+            }
+        }
+
+        throw new SQLException("Không thể hoàn tất migrate cho bảng " + table.getTableName());
+    }
+
+    private static boolean isRetryableException(SQLException e) {
+        if (e == null) {
+            return false;
+        }
+
+        String sqlState = e.getSQLState();
+        if (sqlState != null) {
+            if (sqlState.startsWith("08")
+                    || "40001".equals(sqlState)
+                    || "40P01".equals(sqlState)
+                    || "HYT00".equals(sqlState)
+                    || "HYT01".equals(sqlState)) {
+                return true;
+            }
+        }
+
+        String message = e.getMessage();
+        if (message == null) {
+            return false;
+        }
+
+        String lowered = message.toLowerCase(Locale.ROOT);
+        return lowered.contains("connection")
+                || lowered.contains("socket")
+                || lowered.contains("timed out")
+                || lowered.contains("timeout")
+                || lowered.contains("broken pipe")
+                || lowered.contains("i/o error")
+                || lowered.contains("communications link failure");
+    }
+
+    private static void sleep(long millis) {
+        if (millis <= 0) {
+            return;
+        }
+
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Tiến trình retry bị gián đoạn.", e);
         }
     }
 
